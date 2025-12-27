@@ -36,7 +36,21 @@ def load_raw_matches(
     """
     data_path = Path(data_dir)
     if not data_path.exists():
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
+        abs_path = data_path.resolve()
+        error_msg = (
+            f"Data directory not found: {data_dir}\n"
+            f"Absolute path: {abs_path}\n\n"
+            f"To fix this:\n"
+            f"1. Clone Jeff Sackmann's tennis_atp repository:\n"
+            f"   git clone https://github.com/JeffSackmann/tennis_atp.git\n"
+            f"2. Update the data_dir parameter to point to the correct location\n"
+            f"   For example: data_dir='./tennis_atp' or data_dir='/path/to/tennis_atp'\n"
+            f"3. Or download the CSV files manually and place them in: {data_dir}"
+        )
+        raise FileNotFoundError(error_msg)
+    
+    if not data_path.is_dir():
+        raise NotADirectoryError(f"Path exists but is not a directory: {data_dir}")
     
     if end_year is None:
         from datetime import datetime
@@ -45,7 +59,20 @@ def load_raw_matches(
     all_dfs = []
     years_loaded = []
     
-    for csv_file in sorted(data_path.glob("atp_matches_*.csv")):
+    csv_files = list(sorted(data_path.glob("atp_matches_*.csv")))
+    if not csv_files:
+        error_msg = (
+            f"No CSV files found matching pattern 'atp_matches_*.csv' in {data_dir}\n"
+            f"Absolute path: {data_path.resolve()}\n\n"
+            f"Please ensure the directory contains files named like:\n"
+            f"  - atp_matches_2000.csv\n"
+            f"  - atp_matches_2001.csv\n"
+            f"  - etc.\n\n"
+            f"These files should come from: https://github.com/JeffSackmann/tennis_atp"
+        )
+        raise FileNotFoundError(error_msg)
+    
+    for csv_file in csv_files:
         # Extract year from filename
         try:
             year_str = csv_file.stem.split("_")[-1]
@@ -62,7 +89,27 @@ def load_raw_matches(
             continue
     
     if not all_dfs:
-        raise ValueError(f"No matching CSV files found in {data_dir} for years {start_year}-{end_year}")
+        available_years = []
+        for csv_file in csv_files:
+            try:
+                year_str = csv_file.stem.split("_")[-1]
+                year = int(year_str)
+                available_years.append(year)
+            except (ValueError, IndexError):
+                continue
+        
+        if available_years:
+            error_msg = (
+                f"No matching CSV files found in {data_dir} for years {start_year}-{end_year}\n"
+                f"Available years in dataset: {min(available_years)}-{max(available_years)}\n"
+                f"Please adjust start_year and/or end_year parameters."
+            )
+        else:
+            error_msg = (
+                f"No matching CSV files found in {data_dir} for years {start_year}-{end_year}\n"
+                f"Could not parse years from any filenames."
+            )
+        raise ValueError(error_msg)
     
     combined_df = pd.concat(all_dfs, ignore_index=True)
     
