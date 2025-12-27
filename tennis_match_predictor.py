@@ -431,7 +431,13 @@ def train_model(
     )
     
     logger.info("Training RandomForestClassifier...")
+    logger.info(f"Training set size: {len(X_train)}")
+    logger.info(f"Label distribution: {y_train.value_counts().to_dict()}")
+    logger.info(f"Unique labels: {sorted(y_train.unique())}")
+    
     model.fit(X_train, y_train)
+    
+    logger.info(f"Model classes: {model.classes_}")
     logger.info("Model training complete")
     
     return model
@@ -453,21 +459,63 @@ def evaluate_model(
     Return a dict with these metrics.
     """
     y_pred = model.predict(X_test)
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    y_pred_proba_full = model.predict_proba(X_test)
+    
+    logger.info(f"predict_proba shape: {y_pred_proba_full.shape}")
+    logger.info(f"Model classes: {model.classes_}")
+    logger.info(f"Test set label distribution: {y_test.value_counts().to_dict()}")
+    
+    # Handle case where predict_proba returns single column (only one class seen during training)
+    if y_pred_proba_full.shape[1] == 1:
+        # Only one class was seen during training, use that column
+        y_pred_proba = y_pred_proba_full[:, 0]
+        logger.warning("Model only predicts one class. This may indicate all training labels were the same.")
+        logger.warning("This suggests the dataset may need to be restructured (e.g., include both winner and loser perspectives).")
+    elif y_pred_proba_full.shape[1] == 2:
+        # Standard binary classification case
+        # Find which column corresponds to class 1
+        class_1_idx = np.where(model.classes_ == 1)[0]
+        if len(class_1_idx) > 0:
+            y_pred_proba = y_pred_proba_full[:, class_1_idx[0]]
+        else:
+            # Fallback: use second column if class 1 not found
+            y_pred_proba = y_pred_proba_full[:, 1]
+    else:
+        # Multi-class case (shouldn't happen, but handle gracefully)
+        # Use the probability of class 1 (or the highest probability class)
+        class_1_idx = np.where(model.classes_ == 1)[0]
+        if len(class_1_idx) > 0:
+            y_pred_proba = y_pred_proba_full[:, class_1_idx[0]]
+        else:
+            y_pred_proba = y_pred_proba_full[:, 1] if y_pred_proba_full.shape[1] > 1 else y_pred_proba_full[:, 0]
+        logger.warning(f"Unexpected number of classes: {y_pred_proba_full.shape[1]}")
     
     accuracy = accuracy_score(y_test, y_pred)
-    loss = log_loss(y_test, y_pred_proba)
-    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    
+    # Only compute log_loss and roc_auc if we have valid probabilities
+    try:
+        loss = log_loss(y_test, y_pred_proba)
+    except ValueError as e:
+        logger.warning(f"Could not compute log_loss: {e}")
+        loss = float('nan')
+    
+    try:
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+    except ValueError as e:
+        logger.warning(f"Could not compute ROC AUC: {e}")
+        roc_auc = float('nan')
     
     metrics = {
         "accuracy": float(accuracy),
-        "log_loss": float(loss),
-        "roc_auc": float(roc_auc)
+        "log_loss": float(loss) if not math.isnan(loss) else None,
+        "roc_auc": float(roc_auc) if not math.isnan(roc_auc) else None
     }
     
     logger.info(f"Test set accuracy: {accuracy:.4f}")
-    logger.info(f"Test set log loss: {loss:.4f}")
-    logger.info(f"Test set ROC AUC: {roc_auc:.4f}")
+    if not math.isnan(loss):
+        logger.info(f"Test set log loss: {loss:.4f}")
+    if not math.isnan(roc_auc):
+        logger.info(f"Test set ROC AUC: {roc_auc:.4f}")
     
     return metrics
 
