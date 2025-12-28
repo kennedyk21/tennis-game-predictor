@@ -14,7 +14,12 @@ import logging
 import math
 import json
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score, log_loss, roc_auc_score, precision_score, recall_score,
+    f1_score, confusion_matrix, classification_report, precision_recall_curve,
+    average_precision_score, brier_score_loss, matthews_corrcoef, cohen_kappa_score,
+    roc_curve
+)
 from sklearn.model_selection import train_test_split
 import joblib
 
@@ -523,14 +528,16 @@ def evaluate_model(
     y_test: pd.Series
 ) -> dict:
     """
-    Evaluate the model on the test set.
+    Comprehensive evaluation of the model on the test set.
 
-    Compute:
-      - accuracy
-      - log_loss
-      - roc_auc
+    Computes a wide range of metrics including:
+      - Basic metrics: accuracy, precision, recall, F1-score
+      - Probability metrics: log_loss, ROC AUC, PR AUC, Brier score
+      - Confusion matrix: TP, FP, TN, FN
+      - Agreement metrics: Matthews Correlation Coefficient, Cohen's Kappa
+      - Feature importance (for Random Forest)
 
-    Return a dict with these metrics.
+    Returns a dict with all computed metrics.
     """
     y_pred = model.predict(X_test)
     y_pred_proba_full = model.predict_proba(X_test)
@@ -564,32 +571,163 @@ def evaluate_model(
             y_pred_proba = y_pred_proba_full[:, 1] if y_pred_proba_full.shape[1] > 1 else y_pred_proba_full[:, 0]
         logger.warning(f"Unexpected number of classes: {y_pred_proba_full.shape[1]}")
     
+    # Basic classification metrics
     accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, average='binary', zero_division=0)
+    recall = recall_score(y_test, y_pred, average='binary', zero_division=0)
+    f1 = f1_score(y_test, y_pred, average='binary', zero_division=0)
     
-    # Only compute log_loss and roc_auc if we have valid probabilities
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    # Handle different confusion matrix shapes
+    if cm.size == 4:
+        tn, fp, fn, tp = cm.ravel()
+    elif cm.size == 1:
+        # Only one class predicted
+        if y_pred[0] == 0:
+            tn, fp, fn, tp = int(cm[0, 0]), 0, 0, 0
+        else:
+            tn, fp, fn, tp = 0, 0, 0, int(cm[0, 0])
+    else:
+        # Fallback for unexpected shapes
+        tn, fp, fn, tp = 0, 0, 0, 0
+    
+    # Additional metrics
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    sensitivity = recall  # Same as recall
+    ppv = precision  # Positive Predictive Value
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0  # Negative Predictive Value
+    
+    # Probability-based metrics
     try:
-        loss = log_loss(y_test, y_pred_proba)
+        log_loss_val = log_loss(y_test, y_pred_proba)
     except ValueError as e:
         logger.warning(f"Could not compute log_loss: {e}")
-        loss = float('nan')
+        log_loss_val = float('nan')
     
     try:
         roc_auc = roc_auc_score(y_test, y_pred_proba)
+        fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
     except ValueError as e:
         logger.warning(f"Could not compute ROC AUC: {e}")
         roc_auc = float('nan')
+        fpr, tpr = None, None
     
+    try:
+        pr_auc = average_precision_score(y_test, y_pred_proba)
+        precision_curve, recall_curve, _ = precision_recall_curve(y_test, y_pred_proba)
+    except ValueError as e:
+        logger.warning(f"Could not compute PR AUC: {e}")
+        pr_auc = float('nan')
+        precision_curve, recall_curve = None, None
+    
+    try:
+        brier_score = brier_score_loss(y_test, y_pred_proba)
+    except ValueError as e:
+        logger.warning(f"Could not compute Brier score: {e}")
+        brier_score = float('nan')
+    
+    # Agreement metrics
+    try:
+        mcc = matthews_corrcoef(y_test, y_pred)
+    except ValueError:
+        mcc = float('nan')
+    
+    try:
+        kappa = cohen_kappa_score(y_test, y_pred)
+    except ValueError:
+        kappa = float('nan')
+    
+    # Feature importance (for Random Forest)
+    feature_importance = None
+    if hasattr(model, 'feature_importances_'):
+        feature_importance = {
+            feature: float(importance) 
+            for feature, importance in zip(X_test.columns, model.feature_importances_)
+        }
+        # Sort by importance
+        feature_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
+    
+    # Compile all metrics
     metrics = {
+        # Basic metrics
         "accuracy": float(accuracy),
-        "log_loss": float(loss) if not math.isnan(loss) else None,
-        "roc_auc": float(roc_auc) if not math.isnan(roc_auc) else None
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1_score": float(f1),
+        "specificity": float(specificity),
+        "sensitivity": float(sensitivity),
+        "ppv": float(ppv),  # Positive Predictive Value
+        "npv": float(npv),   # Negative Predictive Value
+        
+        # Confusion matrix
+        "confusion_matrix": {
+            "true_negatives": int(tn),
+            "false_positives": int(fp),
+            "false_negatives": int(fn),
+            "true_positives": int(tp)
+        },
+        
+        # Probability metrics
+        "log_loss": float(log_loss_val) if not math.isnan(log_loss_val) else None,
+        "roc_auc": float(roc_auc) if not math.isnan(roc_auc) else None,
+        "pr_auc": float(pr_auc) if not math.isnan(pr_auc) else None,
+        "brier_score": float(brier_score) if not math.isnan(brier_score) else None,
+        
+        # Agreement metrics
+        "matthews_corrcoef": float(mcc) if not math.isnan(mcc) else None,
+        "cohen_kappa": float(kappa) if not math.isnan(kappa) else None,
+        
+        # Feature importance (if available)
+        "feature_importance": feature_importance,
+        
+        # Additional info
+        "n_test_samples": int(len(y_test)),
+        "class_distribution": y_test.value_counts().to_dict()
     }
     
-    logger.info(f"Test set accuracy: {accuracy:.4f}")
-    if not math.isnan(loss):
-        logger.info(f"Test set log loss: {loss:.4f}")
+    # Log comprehensive metrics
+    logger.info("=" * 60)
+    logger.info("COMPREHENSIVE MODEL EVALUATION METRICS")
+    logger.info("=" * 60)
+    logger.info(f"\nBasic Classification Metrics:")
+    logger.info(f"  Accuracy:        {accuracy:.4f}")
+    logger.info(f"  Precision:       {precision:.4f}")
+    logger.info(f"  Recall:          {recall:.4f}")
+    logger.info(f"  F1-Score:        {f1:.4f}")
+    logger.info(f"  Specificity:     {specificity:.4f}")
+    logger.info(f"  Sensitivity:     {sensitivity:.4f}")
+    logger.info(f"  PPV:             {ppv:.4f}")
+    logger.info(f"  NPV:             {npv:.4f}")
+    
+    logger.info(f"\nConfusion Matrix:")
+    logger.info(f"  True Negatives:  {tn}")
+    logger.info(f"  False Positives: {fp}")
+    logger.info(f"  False Negatives: {fn}")
+    logger.info(f"  True Positives:  {tp}")
+    
+    logger.info(f"\nProbability Metrics:")
+    if not math.isnan(log_loss_val):
+        logger.info(f"  Log Loss:        {log_loss_val:.4f}")
     if not math.isnan(roc_auc):
-        logger.info(f"Test set ROC AUC: {roc_auc:.4f}")
+        logger.info(f"  ROC AUC:         {roc_auc:.4f}")
+    if not math.isnan(pr_auc):
+        logger.info(f"  PR AUC:          {pr_auc:.4f}")
+    if not math.isnan(brier_score):
+        logger.info(f"  Brier Score:     {brier_score:.4f}")
+    
+    logger.info(f"\nAgreement Metrics:")
+    if not math.isnan(mcc):
+        logger.info(f"  Matthews CC:     {mcc:.4f}")
+    if not math.isnan(kappa):
+        logger.info(f"  Cohen's Kappa:   {kappa:.4f}")
+    
+    if feature_importance:
+        logger.info(f"\nTop 5 Most Important Features:")
+        for i, (feature, importance) in enumerate(list(feature_importance.items())[:5], 1):
+            logger.info(f"  {i}. {feature}: {importance:.4f}")
+    
+    logger.info("=" * 60)
     
     return metrics
 
