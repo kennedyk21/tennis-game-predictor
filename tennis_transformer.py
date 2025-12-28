@@ -712,3 +712,255 @@ def load_transformer_model(
     )
     
     return trainer
+
+
+def predict_matches(
+    trainer: EnhancedTransformerTrainer,
+    X: pd.DataFrame,
+    return_probabilities: bool = True
+) -> np.ndarray:
+    """
+    Make predictions on new match data.
+    
+    Args:
+        trainer: Trained EnhancedTransformerTrainer
+        X: Feature DataFrame for matches to predict
+        return_probabilities: If True, return probabilities; if False, return binary predictions
+        
+    Returns:
+        Array of predictions or probabilities
+    """
+    # Ensure features match
+    if list(X.columns) != trainer.feature_cols:
+        missing = set(trainer.feature_cols) - set(X.columns)
+        extra = set(X.columns) - set(trainer.feature_cols)
+        if missing:
+            raise ValueError(f"Missing features: {missing}")
+        if extra:
+            logger.warning(f"Extra features will be ignored: {extra}")
+        X = X[trainer.feature_cols]
+    
+    # Create dataset (no labels needed for prediction)
+    X_scaled = trainer.scaler.transform(X.values.astype(np.float32))
+    X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+    
+    trainer.model.eval()
+    predictions = []
+    
+    # Process in batches to avoid memory issues
+    batch_size = 512
+    with torch.no_grad():
+        for i in range(0, len(X_tensor), batch_size):
+            batch = X_tensor[i:i+batch_size].to(trainer.device)
+            outputs = trainer.model(batch)
+            probs = torch.sigmoid(outputs).cpu().numpy().flatten()
+            predictions.extend(probs)
+    
+    predictions = np.array(predictions)
+    
+    if return_probabilities:
+        return predictions
+    else:
+        return (predictions > 0.5).astype(int)
+
+
+def test_model_predictions(
+    trainer: EnhancedTransformerTrainer,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    show_examples: int = 10,
+    show_errors: bool = True
+) -> pd.DataFrame:
+    """
+    Test the model and show detailed prediction examples.
+    
+    Args:
+        trainer: Trained EnhancedTransformerTrainer
+        X_test: Test features
+        y_test: Test labels
+        show_examples: Number of example predictions to display
+        show_errors: Whether to focus on incorrect predictions
+        
+    Returns:
+        DataFrame with predictions and analysis
+    """
+    logger.info("=" * 60)
+    logger.info("TESTING MODEL PREDICTIONS")
+    logger.info("=" * 60)
+    
+    # Get predictions
+    probabilities = predict_matches(trainer, X_test, return_probabilities=True)
+    predictions = (probabilities > 0.5).astype(int)
+    
+    # Create results dataframe
+    results_df = pd.DataFrame({
+        'actual': y_test.values,
+        'predicted': predictions,
+        'probability': probabilities,
+        'correct': predictions == y_test.values
+    })
+    
+    # Add confidence (distance from 0.5)
+    results_df['confidence'] = np.abs(results_df['probability'] - 0.5)
+    
+    # Overall statistics
+    accuracy = (predictions == y_test.values).mean()
+    correct_count = (predictions == y_test.values).sum()
+    total_count = len(y_test)
+    
+    logger.info(f"\nOverall Performance:")
+    logger.info(f"  Accuracy: {accuracy:.4f} ({correct_count}/{total_count})")
+    logger.info(f"  Correct Predictions: {correct_count}")
+    logger.info(f"  Incorrect Predictions: {total_count - correct_count}")
+    
+    # Confidence analysis
+    high_conf_correct = results_df[(results_df['confidence'] > 0.3) & results_df['correct']]
+    high_conf_wrong = results_df[(results_df['confidence'] > 0.3) & ~results_df['correct']]
+    low_conf = results_df[results_df['confidence'] <= 0.2]
+    
+    logger.info(f"\nConfidence Analysis:")
+    logger.info(f"  High Confidence (>0.8 or <0.2 prob) Correct: {len(high_conf_correct)}")
+    logger.info(f"  High Confidence Wrong: {len(high_conf_wrong)} ⚠️")
+    logger.info(f"  Low Confidence (0.3-0.7 prob): {len(low_conf)}")
+    
+    # Probability calibration
+    logger.info(f"\nProbability Distribution:")
+    bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    for i in range(len(bins)-1):
+        bin_mask = (probabilities >= bins[i]) & (probabilities < bins[i+1])
+        bin_count = bin_mask.sum()
+        if bin_count > 0:
+            bin_accuracy = (predictions[bin_mask] == y_test.values[bin_mask]).mean()
+            logger.info(f"  {bins[i]:.1f}-{bins[i+1]:.1f}: {bin_count:4d} samples, {bin_accuracy:.3f} accuracy")
+    
+    # Show example predictions
+    if show_examples > 0:
+        logger.info(f"\n{'='*60}")
+        if show_errors:
+            logger.info(f"EXAMPLE INCORRECT PREDICTIONS (showing up to {show_examples}):")
+            examples = results_df[~results_df['correct']].head(show_examples)
+        else:
+            logger.info(f"EXAMPLE PREDICTIONS (showing {show_examples}):")
+            examples = results_df.head(show_examples)
+        
+        logger.info(f"{'='*60}")
+        
+        for idx, row in examples.iterrows():
+            actual_label = "WIN" if row['actual'] == 1 else "LOSS"
+            pred_label = "WIN" if row['predicted'] == 1 else "LOSS"
+            status = "✓" if row['correct'] else "✗"
+            
+            logger.info(f"\nSample {idx}:")
+            logger.info(f"  Actual: {actual_label} | Predicted: {pred_label} {status}")
+            logger.info(f"  Probability: {row['probability']:.4f} (confidence: {row['confidence']:.4f})")
+            
+            # Show top contributing features if available
+            if hasattr(trainer.model, 'feature_weights'):
+                feature_importance = trainer.get_feature_importance()
+                sample_features = X_test.iloc[idx]
+                
+                # Get top 5 features by importance for this sample
+                top_features = []
+                for feat, importance in list(feature_importance.items())[:5]:
+                    if feat in sample_features.index:
+                        value = sample_features[feat]
+                        top_features.append(f"{feat}={value:.3f} (imp:{importance:.3f})")
+                
+                if top_features:
+                    logger.info(f"  Top Features: {', '.join(top_features)}")
+    
+    # Error analysis by prediction confidence
+    if show_errors and len(high_conf_wrong) > 0:
+        logger.info(f"\n{'='*60}")
+        logger.info("HIGH CONFIDENCE ERRORS (model was very wrong):")
+        logger.info(f"{'='*60}")
+        
+        high_conf_errors = results_df[~results_df['correct']].nlargest(5, 'confidence')
+        for idx, row in high_conf_errors.iterrows():
+            actual_label = "WIN" if row['actual'] == 1 else "LOSS"
+            pred_label = "WIN" if row['predicted'] == 1 else "LOSS"
+            logger.info(f"\nSample {idx}: Predicted {pred_label} (prob={row['probability']:.4f}), Actually {actual_label}")
+    
+    logger.info(f"\n{'='*60}")
+    
+    return results_df
+
+
+def quick_test(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    quick_mode: bool = True
+) -> Tuple[EnhancedTransformerTrainer, Dict[str, float], pd.DataFrame]:
+    """
+    Quick end-to-end test: train, evaluate, and show predictions.
+    
+    Args:
+        X_train: Training features
+        y_train: Training labels
+        X_test: Test features
+        y_test: Test labels
+        quick_mode: If True, use faster settings for quick testing
+        
+    Returns:
+        Tuple of (trainer, metrics, prediction_results)
+    """
+    logger.info("=" * 60)
+    logger.info("QUICK MODEL TEST - TRAINING")
+    logger.info("=" * 60)
+    
+    # Adjust settings based on mode
+    if quick_mode:
+        epochs = 30
+        patience = 8
+        d_model = 64
+        n_layers = 2
+    else:
+        epochs = 100
+        patience = 15
+        d_model = 128
+        n_layers = 4
+    
+    # Split training into train/val
+    from sklearn.model_selection import train_test_split
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=0.15, random_state=42, stratify=y_train
+    )
+    
+    # Train model
+    trainer = train_transformer_model(
+        X_tr, y_tr,
+        X_val, y_val,
+        d_model=d_model,
+        n_layers=n_layers,
+        epochs=epochs,
+        patience=patience,
+        verbose=True
+    )
+    
+    # Evaluate on test set
+    logger.info("\n" + "=" * 60)
+    logger.info("EVALUATING ON TEST SET")
+    logger.info("=" * 60)
+    
+    metrics = evaluate_transformer_model(trainer, X_test, y_test)
+    
+    # Show detailed predictions
+    prediction_results = test_model_predictions(
+        trainer, X_test, y_test,
+        show_examples=10,
+        show_errors=True
+    )
+    
+    # Summary
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST COMPLETE - SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Test Accuracy: {metrics['accuracy']:.4f}")
+    logger.info(f"Test F1 Score: {metrics['f1_score']:.4f}")
+    if metrics['roc_auc']:
+        logger.info(f"Test ROC AUC: {metrics['roc_auc']:.4f}")
+    logger.info("=" * 60)
+    
+    return trainer, metrics, prediction_results
