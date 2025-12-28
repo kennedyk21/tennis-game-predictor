@@ -633,7 +633,9 @@ def run_pipeline(
     data_dir: str = "./data/tennis_atp",
     start_year: int = 2000,
     end_year: Optional[int] = None,
-    test_start_year: int = 2018
+    test_start_year: int = 2018,
+    model_type: str = "random_forest",
+    transformer_kwargs: Optional[dict] = None
 ) -> None:
     """
     End-to-end pipeline:
@@ -646,9 +648,18 @@ def run_pipeline(
       7. Train model
       8. Evaluate
       9. Save model and metadata
+    
+    Args:
+        data_dir: Directory containing ATP match CSV files
+        start_year: First year to include
+        end_year: Last year to include (None = current year)
+        test_start_year: Year to start test set
+        model_type: "random_forest" or "transformer"
+        transformer_kwargs: Optional dict of kwargs for transformer training
     """
     logger.info("=" * 60)
     logger.info("Starting tennis match prediction pipeline")
+    logger.info(f"Model type: {model_type}")
     logger.info("=" * 60)
     
     # Step 1: Load raw matches
@@ -679,15 +690,57 @@ def run_pipeline(
     
     # Step 7: Train model
     logger.info("\n[7/9] Training model...")
-    model = train_model(X_train, y_train)
+    if model_type == "transformer":
+        try:
+            from tennis_transformer import train_transformer_model, evaluate_transformer_model, save_transformer_model
+            
+            # Create validation set for early stopping
+            from sklearn.model_selection import train_test_split as sk_split
+            X_train_split, X_val, y_train_split, y_val = sk_split(
+                X_train, y_train, test_size=0.1, random_state=42, stratify=y_train
+            )
+            
+            # Default transformer kwargs
+            default_kwargs = {
+                "d_model": 64,
+                "n_heads": 4,
+                "n_layers": 3,
+                "epochs": 50,
+                "batch_size": 256,
+                "patience": 10
+            }
+            if transformer_kwargs:
+                default_kwargs.update(transformer_kwargs)
+            
+            trainer = train_transformer_model(
+                X_train_split, y_train_split,
+                X_val=X_val, y_val=y_val,
+                **default_kwargs
+            )
+            
+            # Step 8: Evaluate
+            logger.info("\n[8/9] Evaluating model...")
+            metrics = evaluate_transformer_model(trainer, X_test, y_test)
+            
+            # Step 9: Save model and metadata
+            logger.info("\n[9/9] Saving model and metadata...")
+            save_transformer_model(trainer, feature_cols, metrics)
+            
+        except ImportError:
+            logger.error("Transformer model not available. Install PyTorch to use transformer model.")
+            logger.info("Falling back to Random Forest...")
+            model_type = "random_forest"
     
-    # Step 8: Evaluate
-    logger.info("\n[8/9] Evaluating model...")
-    metrics = evaluate_model(model, X_test, y_test)
-    
-    # Step 9: Save model and metadata
-    logger.info("\n[9/9] Saving model and metadata...")
-    save_model_and_metadata(model, feature_cols, metrics)
+    if model_type == "random_forest":
+        model = train_model(X_train, y_train)
+        
+        # Step 8: Evaluate
+        logger.info("\n[8/9] Evaluating model...")
+        metrics = evaluate_model(model, X_test, y_test)
+        
+        # Step 9: Save model and metadata
+        logger.info("\n[9/9] Saving model and metadata...")
+        save_model_and_metadata(model, feature_cols, metrics)
     
     logger.info("\n" + "=" * 60)
     logger.info("Pipeline completed successfully!")
@@ -695,14 +748,36 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
+    import sys
+    
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
+    
+    # Choose model type: "random_forest" or "transformer"
+    model_type = "random_forest"
+    if len(sys.argv) > 1:
+        model_type = sys.argv[1].lower()
+    
+    # Transformer-specific hyperparameters (optional)
+    transformer_kwargs = None
+    if model_type == "transformer":
+        transformer_kwargs = {
+            "d_model": 64,
+            "n_heads": 4,
+            "n_layers": 3,
+            "epochs": 50,
+            "batch_size": 256,
+            "patience": 10
+        }
+    
     run_pipeline(
         data_dir="./data/tennis_atp",
         start_year=2000,
         end_year=None,
         test_start_year=2018,
+        model_type=model_type,
+        transformer_kwargs=transformer_kwargs
     )
 
