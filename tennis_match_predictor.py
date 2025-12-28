@@ -160,6 +160,20 @@ def preprocess_matches(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     
+    # Drop any columns that might leak the outcome (scores, match statistics)
+    # We keep winner_name, loser_name, winner_rank, loser_rank, winner_age, loser_age
+    # as these are pre-match information
+    columns_to_drop = []
+    for col in df.columns:
+        col_lower = col.lower()
+        # Drop obvious score columns
+        if "score" in col_lower and col not in ["source_file"]:
+            columns_to_drop.append(col)
+    
+    if columns_to_drop:
+        df = df.drop(columns=columns_to_drop)
+        logger.info(f"Dropped {len(columns_to_drop)} potentially leaky score columns")
+    
     logger.info(f"Preprocessed dataset: {len(df)} matches remaining")
     logger.info(f"Date range: {df['tourney_date'].min()} to {df['tourney_date'].max()}")
     
@@ -332,21 +346,22 @@ def build_model_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.S
     """
     Given the enriched matches DataFrame (with ELO and form features),
     build a modeling dataset.
+    
+    To prevent data leakage, we create two rows per match:
+    - One where Player 1 = winner (y=1)
+    - One where Player 1 = loser (y=0)
+    
+    Features are always computed from Player 1's perspective.
 
     Returns:
       - X: feature DataFrame
-      - y: label Series (1 = Player 1 (winner) wins)
+      - y: label Series (1 = Player 1 wins, 0 = Player 1 loses)
       - years: year Series aligned with X and y
       - feature_cols: list of feature column names used
     """
     df = df.copy()
     
-    # Compute feature differences from winner's perspective
-    df["elo_diff"] = df["winner_elo_pre"] - df["loser_elo_pre"]
-    df["rank_diff"] = df["loser_rank"] - df["winner_rank"]  # lower rank = stronger player
-    df["age_diff"] = df["winner_age"] - df["loser_age"]
-    
-    # Feature columns
+    # Feature columns (will be computed from Player 1's perspective)
     feature_cols = [
         "elo_diff",
         "rank_diff",
@@ -358,26 +373,85 @@ def build_model_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.S
         "best_of"
     ]
     
+    # Create two rows per match: one where Player 1 = winner, one where Player 1 = loser
+    rows = []
+    years_list = []
+    labels = []
+    
+    for idx, row in df.iterrows():
+        # Skip if missing critical features
+        if (pd.isna(row.get("winner_elo_pre")) or pd.isna(row.get("loser_elo_pre")) or
+            pd.isna(row.get("winner_rank")) or pd.isna(row.get("loser_rank"))):
+            continue
+        
+        # Row 1: Player 1 = winner (y=1)
+        p1_elo = row["winner_elo_pre"]
+        p2_elo = row["loser_elo_pre"]
+        p1_rank = row["winner_rank"]
+        p2_rank = row["loser_rank"]
+        p1_age = row.get("winner_age", np.nan)
+        p2_age = row.get("loser_age", np.nan)
+        p1_win_pct = row.get("winner_win_pct_to_date", np.nan)
+        p2_win_pct = row.get("loser_win_pct_to_date", np.nan)
+        p1_surface_win_pct = row.get("winner_surface_win_pct_to_date", np.nan)
+        p2_surface_win_pct = row.get("loser_surface_win_pct_to_date", np.nan)
+        p1_matches = row.get("winner_matches_played_to_date", np.nan)
+        p2_matches = row.get("loser_matches_played_to_date", np.nan)
+        p1_surface_matches = row.get("winner_surface_matches_played_to_date", np.nan)
+        p2_surface_matches = row.get("loser_surface_matches_played_to_date", np.nan)
+        best_of = row.get("best_of", np.nan)
+        
+        # Compute features from Player 1's perspective
+        feature_row_1 = {
+            "elo_diff": p1_elo - p2_elo,
+            "rank_diff": p2_rank - p1_rank,  # lower rank = stronger player
+            "age_diff": p1_age - p2_age,
+            "win_pct_diff": p1_win_pct - p2_win_pct if not (pd.isna(p1_win_pct) or pd.isna(p2_win_pct)) else np.nan,
+            "surface_win_pct_diff": p1_surface_win_pct - p2_surface_win_pct if not (pd.isna(p1_surface_win_pct) or pd.isna(p2_surface_win_pct)) else np.nan,
+            "matches_played_diff": p1_matches - p2_matches if not (pd.isna(p1_matches) or pd.isna(p2_matches)) else np.nan,
+            "surface_matches_played_diff": p1_surface_matches - p2_surface_matches if not (pd.isna(p1_surface_matches) or pd.isna(p2_surface_matches)) else np.nan,
+            "best_of": best_of
+        }
+        
+        rows.append(feature_row_1)
+        years_list.append(row["year"])
+        labels.append(1)  # Player 1 wins
+        
+        # Row 2: Player 1 = loser (y=0) - swap the players
+        feature_row_2 = {
+            "elo_diff": p2_elo - p1_elo,
+            "rank_diff": p1_rank - p2_rank,
+            "age_diff": p2_age - p1_age,
+            "win_pct_diff": p2_win_pct - p1_win_pct if not (pd.isna(p1_win_pct) or pd.isna(p2_win_pct)) else np.nan,
+            "surface_win_pct_diff": p2_surface_win_pct - p1_surface_win_pct if not (pd.isna(p1_surface_win_pct) or pd.isna(p2_surface_win_pct)) else np.nan,
+            "matches_played_diff": p2_matches - p1_matches if not (pd.isna(p1_matches) or pd.isna(p2_matches)) else np.nan,
+            "surface_matches_played_diff": p2_surface_matches - p1_surface_matches if not (pd.isna(p1_surface_matches) or pd.isna(p2_surface_matches)) else np.nan,
+            "best_of": best_of
+        }
+        
+        rows.append(feature_row_2)
+        years_list.append(row["year"])
+        labels.append(0)  # Player 1 loses
+    
+    # Create DataFrames
+    X = pd.DataFrame(rows)
+    y = pd.Series(labels, name="y")
+    years = pd.Series(years_list, name="year")
+    
     # Check which features exist
-    available_features = [col for col in feature_cols if col in df.columns]
+    available_features = [col for col in feature_cols if col in X.columns]
     
-    # Create feature DataFrame
-    X = df[available_features].copy()
-    
-    # Label: always 1 since winner is Player 1
-    y = pd.Series(1, index=X.index, name="y")
-    
-    # Get years before filtering
-    years = df["year"].copy()
-    
-    # Drop rows with any NaN in features
+    # Drop rows with any NaN in critical features (keep best_of NaN if needed)
+    critical_features = [f for f in available_features if f != "best_of"]
     initial_count = len(X)
-    mask = ~X[available_features].isna().any(axis=1)
+    mask = ~X[critical_features].isna().any(axis=1)
     X = X[mask].reset_index(drop=True)
     y = y[mask].reset_index(drop=True)
     years = years[mask].reset_index(drop=True)
     
-    logger.info(f"Built modeling dataset: {len(X)} matches (dropped {initial_count - len(X)} with missing features)")
+    logger.info(f"Built modeling dataset: {len(X)} rows ({len(X)//2} matches, duplicated)")
+    logger.info(f"Dropped {initial_count - len(X)} rows with missing features")
+    logger.info(f"Label distribution: {y.value_counts().to_dict()}")
     
     return X, y, years, available_features
 
